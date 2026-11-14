@@ -1,0 +1,13 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "telegram-relay-bot"
+main = "src/index.js"
+compatibility_date = "2026-11-14"
+
+# 日志可以在 Cloudflare 面板的 Workers Logs 中查看。
+[observability]
+enabled = true
+
+# 运行 `npx wrangler kv namespace create BOT_KV` 后，把生成的 id 填到这里。
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "acaeac97e9164d3aa8cfba3db236fe3e"
