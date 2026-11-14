@@ -1,6 +1,6 @@
 # Telegram 双向中继 Bot（Cloudflare Workers）
 
-一个无状态、无数据库的 Telegram 私聊中继：陌生人给 Bot 发消息，Bot 转发给主人；主人直接回复那条通知，内容就发回原用户。屏蔽列表和主人 UID 都存在 Workers KV 里。
+一个无状态、无数据库的 Telegram 私聊中继：陌生人给 Bot 发消息，Bot 转发给主人；主人直接回复那条通知，内容就发回原用户。支持文字、图片、视频、文件、语音和贴纸，屏蔽列表和主人 UID 都存在 Workers KV 里。
 
 ## 设计
 
@@ -8,6 +8,7 @@
 - **配置与凭证分离**：`owner_id` 与 `spam:<chat_id>` 放 KV；`BOT_TOKEN`、`WEBHOOK_SECRET` 只放 Worker Secrets，不写进代码或仓库。
 - **请求来源校验**：校验 `X-Telegram-Bot-Api-Secret-Token`，未配置 secret 时直接拒绝（fail closed）。
 - **失败不重投**：Telegram API 出错只记录日志并返回 `200`，避免 Telegram 重投 update 导致同一消息被转发两次。
+- **媒体复用 file_id**：图片、视频、动图、文件、音频、语音直接按 `file_id` 转发，不下载、不重新上传；路由写在媒体 caption 的第二行。
 
 通知格式：
 
@@ -18,6 +19,27 @@
 ```
 
 第二行 `123456789-42` = `chat_id` + `-` + `message_id`。
+
+媒体消息会把同样的三行写进 caption：
+
+```text
+张三 (@zhangsan) 来消息了：
+123456789-42
+看图
+```
+
+## 媒体转发
+
+| 消息类型 | 转发方式 | 回复方式 |
+| --- | --- | --- |
+| 图片 | `sendPhoto`，复用 `file_id` + caption | 回复图片 |
+| 视频 | `sendVideo`，复用 `file_id` + caption | 回复视频 |
+| 动图 / 文件 / 音频 / 语音 | 对应的 `send*` 方法，复用 `file_id` + caption | 回复该消息 |
+| 贴纸（webp / tgs / webm） | `sendSticker` 后补一条文字通知 | 回复贴纸下面的文字通知 |
+| 视频留言 | `sendVideoNote` 后补一条文字通知 | 回复文字通知 |
+| 位置 / 联系人 / 投票等 | 文字通知 | 回复通知 |
+
+媒体不会下载或重新上传：同一个 Bot 内可以直接复用 `file_id`。文件中转失败（过大、类型不被接受）时会退化为文字通知，不会静默丢失。
 
 ## 目录结构
 
@@ -171,8 +193,10 @@ curl.exe -sS -X POST "http://127.0.0.1:8787/" `
 - Bot Token 只存在 Secret 中，日志与错误信息不会带出 token。
 - 转发内容是明文；Telegram 与 Cloudflare 都能看到，不适合传敏感信息。
 - 没有白名单和限速：任何人只要知道 Bot 用户名都能给主人发消息。需要的话可以在 KV 里加 `allow:<chat_id>` 或按 chat 做冷却。
-- 单条消息上限 4096 字符，超出部分会被截断（通知与回信都会）。
-- 用户发来的图片/文件只显示 `[photo]`、`[document]` 等类型和 caption，不会复制媒体本体；主人回信也只支持文字或带说明文字的媒体。
+- 单条消息上限 4096 字符，媒体 caption 上限 1024 字符，超出部分会被截断（通知与回信都会）。
+- 媒体按 `file_id` 转发，不落地、不重新上传；文件过大或类型不被接受时会退化为文字通知。
+- 贴纸本身没有 caption，不能直接回复贴纸，请回复紧随其后的文字通知。
+- 主人回信只支持文字或带说明文字的媒体，不会把主人发的图片本体转发给用户。
 - 只有 `owner_id` 对应私聊里的消息会被当作主人指令；Bot 被拉进群时，群消息会以整个群为单位转发和屏蔽。
 - 群聊里主人的发言不会触发指令（因为 `chat.id` 是群 id 而不是主人 UID）。
 
@@ -183,5 +207,7 @@ curl.exe -sS -X POST "http://127.0.0.1:8787/" `
 **收不到通知**：确认主人已给 Bot 发过 `/start`；确认 KV 里有 `owner_id`（`npx wrangler kv key get --binding=BOT_KV --remote owner_id`）；用 `wrangler tail` 或面板日志看是否有 Telegram API 报错。
 
 **回信没发出去**：原用户可能已经删除会话或屏蔽了 Bot；`allow_sending_without_reply` 只解决原消息被删除的情况，解决不了对方拒收。
+
+**回复贴纸没反应**：贴纸没有 caption，本身不带路由。回复贴纸下方那条「来消息了」文字通知即可。
 
 **改了 owner_id 不生效**：KV 读取有缓存，等约 60 秒；同时确认值里没有多余空格。
