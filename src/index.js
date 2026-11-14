@@ -8,6 +8,7 @@
  * 媒体转发：
  * - 图片 / 视频 / 动图 / 文件 / 音频 / 语音：复用 file_id 直接转发，路由写在 caption 里。
  * - webp / tgs / webm 贴纸：贴纸没有 caption，先转发贴纸，再补一条文字通知承载路由。
+ * - 主人回复同样支持这些媒体，复用 file_id 发回原用户。
  */
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -181,23 +182,38 @@ async function handleOwnerMessage(message, env) {
     return;
   }
 
-  if (isCommand(text, "spam")) {
-    await env.BOT_KV.put(`spam:${route.chatId}`, "1");
-    await telegram(env, "sendMessage", {
-      chat_id: message.chat.id,
-      text: `已屏蔽用户 ${route.chatId}，之后其消息不再转发。`,
-      reply_parameters: { message_id: message.message_id },
-    });
-    return;
+  // 命令只认纯文字消息，避免带 caption 的媒体误触发。
+  if (typeof message.text === "string") {
+    if (isCommand(text, "spam")) {
+      await env.BOT_KV.put(`spam:${route.chatId}`, "1");
+      await telegram(env, "sendMessage", {
+        chat_id: message.chat.id,
+        text: `已屏蔽用户 ${route.chatId}，之后其消息不再转发。`,
+        reply_parameters: { message_id: message.message_id },
+      });
+      return;
+    }
+
+    if (isCommand(text, "unspam")) {
+      await env.BOT_KV.delete(`spam:${route.chatId}`);
+      await telegram(env, "sendMessage", {
+        chat_id: message.chat.id,
+        text: `已解除屏蔽 ${route.chatId}，之后会继续转发其消息。`,
+        reply_parameters: { message_id: message.message_id },
+      });
+      return;
+    }
   }
 
-  if (isCommand(text, "unspam")) {
-    await env.BOT_KV.delete(`spam:${route.chatId}`);
-    await telegram(env, "sendMessage", {
-      chat_id: message.chat.id,
-      text: `已解除屏蔽 ${route.chatId}，之后会继续转发其消息。`,
-      reply_parameters: { message_id: message.message_id },
-    });
+  const replyParameters = {
+    message_id: route.messageId,
+    allow_sending_without_reply: true,
+  };
+
+  // 主人的回复也可能是媒体：图片、视频、文件、语音、贴纸都按 file_id 转回去。
+  const media = mediaDescriptor(message);
+  if (media) {
+    await forwardOwnerMedia(env, message, route, media, replyParameters);
     return;
   }
 
@@ -221,11 +237,61 @@ async function handleOwnerMessage(message, env) {
   await telegram(env, "sendMessage", {
     chat_id: route.chatId,
     text: truncate(content, MAX_TEXT_LENGTH),
-    reply_parameters: {
-      message_id: route.messageId,
-      allow_sending_without_reply: true,
-    },
+    reply_parameters: replyParameters,
   });
+}
+
+async function forwardOwnerMedia(env, message, route, media, replyParameters) {
+  const caption = typeof message.caption === "string" ? message.caption.trim() : "";
+
+  try {
+    if (media.kind === "sticker") {
+      await telegram(env, "sendSticker", {
+        chat_id: route.chatId,
+        sticker: media.fileId,
+        reply_parameters: replyParameters,
+      });
+      return;
+    }
+
+    if (media.kind === "video_note") {
+      await telegram(env, "sendVideoNote", {
+        chat_id: route.chatId,
+        video_note: media.fileId,
+        reply_parameters: replyParameters,
+      });
+      return;
+    }
+
+    const params = {
+      chat_id: route.chatId,
+      [media.field]: media.fileId,
+      reply_parameters: replyParameters,
+    };
+    if (caption) {
+      params.caption = truncate(caption, MAX_CAPTION_LENGTH);
+    }
+
+    await telegram(env, media.method, params);
+  } catch (error) {
+    console.error(`转发主人的 ${media.method ?? media.kind} 失败:`, error);
+
+    // 媒体发不出去时至少把说明文字发过去；没有文字就告诉主人失败了。
+    if (caption) {
+      await telegram(env, "sendMessage", {
+        chat_id: route.chatId,
+        text: truncate(caption, MAX_TEXT_LENGTH),
+        reply_parameters: replyParameters,
+      });
+      return;
+    }
+
+    await telegram(env, "sendMessage", {
+      chat_id: message.chat.id,
+      text: "媒体转发失败，请换一个文件或改用文字回复。",
+      reply_parameters: { message_id: message.message_id },
+    });
+  }
 }
 
 /**
