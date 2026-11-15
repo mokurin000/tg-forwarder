@@ -1,19 +1,25 @@
+
 /**
- * 无状态 Telegram 双向中继 Bot（Cloudflare Workers）。
+ * Stateless Telegram two-way relay bot (Cloudflare Workers).
  *
- * 路由方式：通知正文第二行固定为 `chatId-messageId`。
- * 文本通知、媒体 caption、贴纸说明都通过这一行承载路由，
- * 主人回复该消息即可定位原会话，不需要保存消息映射。
+ * Routing: The second line of every notification is `chatId-messageId`.
+ * Text notifications, media captions, and sticker descriptions all carry
+ * this routing information, allowing the owner to reply without storing
+ * any message mappings.
  *
- * 媒体转发：
- * - 图片 / 视频 / 动图 / 文件 / 音频 / 语音：复用 file_id 直接转发，路由写在 caption 里。
- * - webp / tgs / webm 贴纸：贴纸没有 caption，先转发贴纸，再补一条文字通知承载路由。
- * - 主人回复同样支持这些媒体，复用 file_id 发回原用户。
+ * Media forwarding:
+ * - Photos / videos / animations / documents / audio / voice messages:
+ *   Forward directly using the original file_id, with routing information
+ *   embedded in the caption.
+ * - WebP / TGS / WebM stickers: Stickers do not support captions, so the
+ *   bot forwards the sticker first and then sends a separate text notification.
+ * - The owner can also reply with these media types, which are forwarded
+ *   using their original file_id.
  */
 
 const TELEGRAM_API = "https://api.telegram.org";
-const MAX_TEXT_LENGTH = 4096; // sendMessage 的 text 上限（UTF-16 码元）
-const MAX_CAPTION_LENGTH = 1024; // 媒体 caption 上限（UTF-16 码元）
+const MAX_TEXT_LENGTH = 4096; // sendMessage text limit (UTF-16 code units)
+const MAX_CAPTION_LENGTH = 1024; // Media caption limit (UTF-16 code units)
 const ROUTE_PATTERN = /^(-?\d+)-(\d+)$/;
 
 const MESSAGE_TYPES = [
@@ -41,7 +47,8 @@ export default {
       return textResponse("OK");
     }
 
-    // 用 Telegram 的 secret token 校验请求来源；未配置时一律拒绝（fail closed）。
+    // Verify the request using Telegram's secret token.
+    // Reject all requests if the secret is not configured (fail closed).
     const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
     if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) {
       return textResponse("Unauthorized", 401);
@@ -57,8 +64,9 @@ export default {
     try {
       await handleUpdate(update, env);
     } catch (error) {
-      // 返回 4xx/5xx 会让 Telegram 反复重投同一条 update，可能给用户重复发消息。
-      console.error("处理 update 失败:", error);
+      // Returning a 4xx/5xx response would cause Telegram to retry the update,
+      // potentially delivering the same message multiple times.
+      console.error("Failed to process update:", error);
     }
 
     return textResponse("OK");
@@ -73,24 +81,25 @@ async function handleUpdate(update, env) {
 
   const ownerId = String((await env.BOT_KV.get("owner_id")) ?? "").trim();
   if (!ownerId) {
-    console.error("KV 中缺少 owner_id，请在部署后写入该键。");
+    console.error("Missing owner_id in KV. Set this key after deployment.");
     return;
   }
 
-  // 主人的私聊：只处理「回复某条通知」的消息。
+  // Handle private messages from the owner.
+  // Only replies to forwarded notifications are processed.
   if (String(message.chat.id) === ownerId) {
     await handleOwnerMessage(message, env);
     return;
   }
 
-  // 忽略其它 Bot，避免两个 Bot 互相回环。
+  // Ignore messages from other bots to prevent bot-to-bot loops.
   if (message.from.is_bot) {
     return;
   }
 
   const chatId = String(message.chat.id);
 
-  // 已被屏蔽的用户/群：静默丢弃，不给主人任何提示。
+  // Silently drop messages from blocked users or groups.
   if (await env.BOT_KV.get(`spam:${chatId}`)) {
     return;
   }
@@ -101,7 +110,7 @@ async function handleUpdate(update, env) {
 async function forwardToOwner(message, env, ownerId, chatId) {
   const media = mediaDescriptor(message);
 
-  // 纯文本、位置、投票等服务消息：仍然是文字通知。
+  // Text, locations, polls, and other service messages are sent as text notifications.
   if (!media) {
     await sendNotification(env, ownerId, message, chatId, null, describeContent(message));
     return;
@@ -113,7 +122,8 @@ async function forwardToOwner(message, env, ownerId, chatId) {
   }
 
   if (media.kind === "video_note") {
-    // 视频留言没有 caption，单独转发后用文字通知承载路由。
+    // Video notes do not support captions, so send a separate text notification
+    // containing the routing information.
     const sent = await safeSend(env, "sendVideoNote", {
       chat_id: ownerId,
       video_note: media.fileId,
@@ -136,15 +146,16 @@ async function forwardToOwner(message, env, ownerId, chatId) {
       caption,
     });
   } catch (error) {
-    // 文件过大、类型不被接受等情况：至少让主人知道有人发了什么。
-    console.error(`转发 ${media.method} 失败，回退为文字通知:`, error);
+    // Fall back to a text notification if the media cannot be forwarded,
+    // for example, because it is too large or unsupported.
+    console.error(`Failed to forward ${media.method}, falling back to text:`, error);
     await sendNotification(env, ownerId, message, chatId, null, fallbackContent(message));
   }
 }
 
 async function forwardSticker(env, ownerId, message, chatId, media) {
-  // 贴纸没有 caption：先转发贴纸，再让文字通知作为它的回复，
-  // 这样主人回复文字通知仍然可以路由回原用户。
+  // Stickers do not support captions. Forward the sticker first, then send
+  // a text notification as a reply so the owner can reply to it.
   const sent = await safeSend(env, "sendSticker", {
     chat_id: ownerId,
     sticker: media.fileId,
@@ -174,7 +185,8 @@ async function handleOwnerMessage(message, env) {
   const replied = message.reply_to_message;
   const route = parseRoute(replied?.text) ?? parseRoute(replied?.caption);
 
-  // 不是对通知的回复：只有命令才回应，避免主人随手发消息时被 Bot 打扰。
+  // Ignore messages that are not replies to notifications.
+  // Only respond to commands to avoid interrupting the owner unnecessarily.
   if (!route) {
     if (text.startsWith("/")) {
       await sendUsage(env, message.chat.id, message.message_id);
@@ -182,13 +194,14 @@ async function handleOwnerMessage(message, env) {
     return;
   }
 
-  // 命令只认纯文字消息，避免带 caption 的媒体误触发。
+  // Commands are only recognized in plain text messages.
+  // This prevents media captions from accidentally triggering commands.
   if (typeof message.text === "string") {
     if (isCommand(text, "spam")) {
       await env.BOT_KV.put(`spam:${route.chatId}`, "1");
       await telegram(env, "sendMessage", {
         chat_id: message.chat.id,
-        text: `已屏蔽用户 ${route.chatId}，之后其消息不再转发。`,
+        text: `Blocked user ${route.chatId}. Their messages will no longer be forwarded.`,
         reply_parameters: { message_id: message.message_id },
       });
       return;
@@ -198,7 +211,7 @@ async function handleOwnerMessage(message, env) {
       await env.BOT_KV.delete(`spam:${route.chatId}`);
       await telegram(env, "sendMessage", {
         chat_id: message.chat.id,
-        text: `已解除屏蔽 ${route.chatId}，之后会继续转发其消息。`,
+        text: `Unblocked ${route.chatId}. Their messages will be forwarded again.`,
         reply_parameters: { message_id: message.message_id },
       });
       return;
@@ -210,7 +223,9 @@ async function handleOwnerMessage(message, env) {
     allow_sending_without_reply: true,
   };
 
-  // 主人的回复也可能是媒体：图片、视频、文件、语音、贴纸都按 file_id 转回去。
+  // The owner's replies can also contain media.
+  // Photos, videos, documents, voice messages, and stickers are forwarded
+  // using their original file_id.
   const media = mediaDescriptor(message);
   if (media) {
     await forwardOwnerMedia(env, message, route, media, replyParameters);
@@ -225,10 +240,11 @@ async function handleOwnerMessage(message, env) {
         : "";
 
   if (!content.trim()) {
-    // 主人只发了媒体、或只有空白字符：明确告知无法转发，而不是静默丢弃。
+    // Do not silently drop empty replies or unsupported messages.
+    // Tell the owner how to send a valid reply instead.
     await telegram(env, "sendMessage", {
       chat_id: message.chat.id,
-      text: "无法转发该回复：请用文字回复，或给图片/文件添加说明文字。",
+      text: "Unable to forward this reply. Send a text message or add a caption to your media.",
       reply_parameters: { message_id: message.message_id },
     });
     return;
@@ -274,9 +290,10 @@ async function forwardOwnerMedia(env, message, route, media, replyParameters) {
 
     await telegram(env, media.method, params);
   } catch (error) {
-    console.error(`转发主人的 ${media.method ?? media.kind} 失败:`, error);
+    console.error(`Failed to forward owner's ${media.method ?? media.kind}:`, error);
 
-    // 媒体发不出去时至少把说明文字发过去；没有文字就告诉主人失败了。
+    // If media forwarding fails, at least send the caption as text.
+    // If there is no caption, notify the owner about the failure.
     if (caption) {
       await telegram(env, "sendMessage", {
         chat_id: route.chatId,
@@ -288,21 +305,21 @@ async function forwardOwnerMedia(env, message, route, media, replyParameters) {
 
     await telegram(env, "sendMessage", {
       chat_id: message.chat.id,
-      text: "媒体转发失败，请换一个文件或改用文字回复。",
+      text: "Failed to forward the media. Please try another file or send a text message instead.",
       reply_parameters: { message_id: message.message_id },
     });
   }
 }
 
 /**
- * 通知格式（第二行固定为路由信息）：
+ * Notification format (the second line always contains routing information):
  *
- *   张三 (@zhangsan) 来消息了：
+ *   John Doe (@johndoe) sent you a message:
  *   123456789-42
- *   你好
+ *   Hello!
  */
 function buildNotification(message, chatId, limit, content) {
-  const header = `${displayName(message.from)} 来消息了：`;
+  const header = `${displayName(message.from)} sent you a message:`;
   const routeLine = `${chatId}-${message.message_id}`;
   const lines = [header, routeLine];
 
@@ -322,7 +339,7 @@ function mediaDescriptor(message) {
     };
   }
 
-  // 注意：动画消息同时带 document 字段，必须先判断 animation。
+  // Animations also contain a document field, so check animation first.
   if (message.animation) {
     return { kind: "file", method: "sendAnimation", field: "animation", fileId: message.animation.file_id };
   }
@@ -357,7 +374,8 @@ function displayName(from) {
       .trim() || "Unknown";
   const username = from.username ? ` (@${from.username})` : "";
 
-  // 名字理论上可能带换行，清掉以保证第二行一定是路由信息。
+  // Names may contain newlines, so strip them to ensure the route is always
+  // on the second line.
   return `${name}${username}`.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
@@ -385,7 +403,7 @@ function mediaLabel(message) {
       return type;
     }
   }
-  return "不支持的消息类型";
+  return "unsupported message type";
 }
 
 function parseRoute(text) {
@@ -406,7 +424,8 @@ function parseRoute(text) {
   const chatId = match[1];
   const messageId = Number(match[2]);
 
-  // message_id 必须为正整数，否则一定是伪造/损坏的路由行。
+  // message_id must be a positive integer.
+  // Reject malformed or tampered routing information.
   if (!Number.isSafeInteger(messageId) || messageId <= 0) {
     return null;
   }
@@ -422,9 +441,9 @@ async function sendUsage(env, chatId, messageId) {
   await telegram(env, "sendMessage", {
     chat_id: chatId,
     text: [
-      "使用说明：",
-      "1. 直接回复 Bot 转发来的通知，内容会发回原用户。",
-      "2. 回复 /spam 屏蔽该用户，/unspam 解除屏蔽。",
+      "Usage:",
+      "1. Reply directly to a notification forwarded by the bot to message the original sender.",
+      "2. Reply with /spam to block a user, or /unspam to unblock them.",
     ].join("\n"),
     reply_parameters: { message_id: messageId },
   });
@@ -438,7 +457,8 @@ function truncate(text, max) {
     return "…";
   }
 
-  // 不要从 UTF-16 代理对中间截断，否则会留下孤立代理项，Telegram 可能直接拒收。
+  // Avoid splitting a UTF-16 surrogate pair, which could leave an invalid
+  // surrogate and cause Telegram to reject the message.
   let end = max - 1;
   const code = text.charCodeAt(end - 1);
   if (code >= 0xd800 && code <= 0xdbff) {
@@ -452,21 +472,22 @@ async function safeSend(env, method, params) {
   try {
     return await telegram(env, method, params);
   } catch (error) {
-    console.error(`Telegram ${method} 调用失败:`, error);
+    console.error(`Telegram ${method} request failed:`, error);
     return null;
   }
 }
 
 async function telegram(env, method, params) {
   if (!env.BOT_TOKEN) {
-    throw new Error("BOT_TOKEN 未配置，请运行 `npx wrangler secret put BOT_TOKEN`。");
+    throw new Error("BOT_TOKEN is not configured.");
   }
 
   const response = await fetch(`${TELEGRAM_API}/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(params),
-    // 避免 Telegram 接口长时间无响应拖到 webhook 超时，引发重复投递。
+    // Prevent Telegram API requests from hanging long enough to time out
+    // the webhook and trigger duplicate update deliveries.
     signal: AbortSignal.timeout(10_000),
   });
 
@@ -474,13 +495,13 @@ async function telegram(env, method, params) {
   try {
     result = await response.json();
   } catch {
-    throw new Error(`Telegram ${method} 返回了非 JSON 响应（HTTP ${response.status}）`);
+    throw new Error(`Telegram ${method} returned a non-JSON response (HTTP ${response.status})`);
   }
 
   if (!result?.ok) {
     throw new Error(
-      `Telegram ${method} 失败（${result?.error_code ?? response.status}）：${
-        result?.description ?? "未知错误"
+      `Telegram ${method} failed (${result?.error_code ?? response.status}): ${
+        result?.description ?? "Unknown error"
       }`
     );
   }
