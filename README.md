@@ -1,215 +1,318 @@
-# Telegram 双向中继 Bot（Cloudflare Workers）
+# Telegram Two-Way Relay Bot
 
-一个无状态、无数据库的 Telegram 私聊中继：陌生人给 Bot 发消息，Bot 转发给主人；主人直接回复那条通知，内容就发回原用户。支持文字、图片、视频、文件、语音和贴纸，屏蔽列表和主人 UID 都存在 Workers KV 里。
+A lightweight, stateless Telegram relay bot running on Cloudflare Workers.
 
-## 设计
+Users can send messages to your bot, and the bot forwards them to you. Simply reply to a forwarded message to send your response back to the original sender.
 
-- **无状态路由**：不保存「通知消息 → 原消息」的映射。通知正文第二行固定写入 `chatId-messageId`，主人回复通知时解析这一行即可定位原会话，因此不需要 Durable Objects。
-- **配置与凭证分离**：`owner_id` 与 `spam:<chat_id>` 放 KV；`BOT_TOKEN`、`WEBHOOK_SECRET` 只放 Worker Secrets，不写进代码或仓库。
-- **请求来源校验**：校验 `X-Telegram-Bot-Api-Secret-Token`，未配置 secret 时直接拒绝（fail closed）。
-- **失败不重投**：Telegram API 出错只记录日志并返回 `200`，避免 Telegram 重投 update 导致同一消息被转发两次。
-- **媒体复用 file_id**：收发两个方向都直接按 `file_id` 转发图片、视频、动图、文件、音频、语音和贴纸，不下载、不重新上传；用户发来的媒体路由写在 caption 的第二行。
+Supports text, photos, videos, animations, documents, audio, voice messages, stickers, and more.
 
-通知格式：
+No database, no Durable Objects, and no message mapping table. Cloudflare KV is only used for configuration and the blocklist.
+
+## Features
+
+- **Stateless message routing** — The original `chat_id` and `message_id` are embedded in the forwarded message, so no message mapping needs to be stored.
+- **Two-way relay** — Reply directly to a forwarded notification to message the original sender.
+- **Media support** — Supports photos, videos, animations, documents, audio, voice messages, and stickers using Telegram's existing `file_id`.
+- **Blocklist** — Block or unblock users by replying to their messages with `/spam` or `/unspam`.
+- **Cloudflare KV storage** — Stores the owner ID and blocklist entries.
+- **Secure configuration** — Bot credentials and webhook secrets are stored as Cloudflare Worker Secrets.
+- **Webhook verification** — Validates Telegram's `X-Telegram-Bot-Api-Secret-Token` header. Requests are rejected if no webhook secret is configured.
+- **No duplicate retries** — Telegram API errors are logged, but the Worker still returns HTTP 200 to prevent Telegram from retrying the same update.
+
+## How It Works
+
+The bot does not maintain a mapping between forwarded messages and their original messages.
+
+Instead, every forwarded notification includes a routing identifier on its second line:
 
 ```text
-张三 (@zhangsan) 来消息了：
+John Doe (@johndoe) sent you a message:
 123456789-42
-你好
+Hello!
 ```
 
-第二行 `123456789-42` = `chat_id` + `-` + `message_id`。
-
-媒体消息会把同样的三行写进 caption：
+The second line contains:
 
 ```text
-张三 (@zhangsan) 来消息了：
-123456789-42
-看图
+<chat_id>-<message_id>
 ```
 
-## 媒体转发
+When you reply to the notification, the bot extracts these values and sends your reply to the original chat.
 
-| 消息类型 | 转发方式 | 回复方式 |
+For media messages, the same routing information is stored in the caption.
+
+This approach keeps the bot completely stateless and eliminates the need for Durable Objects or a database.
+
+## Media Support
+
+The bot reuses Telegram `file_id` values to forward media in both directions. Files are never downloaded or uploaded again.
+
+| Message type | Forwarding | Replying |
 | --- | --- | --- |
-| 图片 | `sendPhoto`，复用 `file_id` + caption | 回复图片 |
-| 视频 | `sendVideo`，复用 `file_id` + caption | 回复视频 |
-| 动图 / 文件 / 音频 / 语音 | 对应的 `send*` 方法，复用 `file_id` + caption | 回复该消息 |
-| 贴纸（webp / tgs / webm） | `sendSticker` 后补一条文字通知 | 回复贴纸下面的文字通知 |
-| 视频留言 | `sendVideoNote` 后补一条文字通知 | 回复文字通知 |
-| 位置 / 联系人 / 投票等 | 文字通知 | 回复通知 |
+| Photo | `sendPhoto` with the original `file_id` and caption | Reply to the photo |
+| Video | `sendVideo` with the original `file_id` and caption | Reply to the video |
+| Animation | Corresponding `send*` method with the original `file_id` | Reply to the animation |
+| Document | `sendDocument` with the original `file_id` | Reply to the document |
+| Audio | `sendAudio` with the original `file_id` | Reply to the audio |
+| Voice message | `sendVoice` with the original `file_id` | Reply to the voice message |
+| Sticker | `sendSticker`, followed by a text notification | Reply to the text notification |
+| Video note | `sendVideoNote`, followed by a text notification | Reply to the text notification |
+| Location, contact, poll, etc. | Text notification | Reply to the notification |
 
-媒体不会下载或重新上传：同一个 Bot 内可以直接复用 `file_id`。文件中转失败（过大、类型不被接受）时会退化为文字通知，不会静默丢失。
+### Media Fallbacks
 
-主人回信同样支持媒体：图片、视频、动图、文件、音频、语音、贴纸都会复用 `file_id` 发回原用户，并挂在用户原消息下面；带 caption 的媒体会保留 caption。媒体发送失败时会退化为发送 caption 文字，没有文字则提示主人换一个文件。
+- If forwarding a media file fails (for example, due to file size or unsupported media types), the bot falls back to a text notification instead of silently dropping the message.
+- Stickers do not support captions, so a separate text notification is sent after the sticker. Reply to that notification to respond.
+- Video notes are handled in the same way as stickers.
+- When replying with media, the bot sends it directly to the original user and attaches it as a reply to their original message.
+- Captions are preserved when forwarding supported media.
+- If sending reply media fails, the bot falls back to sending the caption as text. If no caption is available, it asks you to try another file.
 
-## 目录结构
+## Project Structure
 
 ```text
-src/index.js           Worker 全部逻辑
-wrangler.toml          Worker 配置（需填入 KV namespace id）
-.dev.vars.example      本地开发用的环境变量示例
+.
+├── src/
+│   └── index.js           # Cloudflare Worker implementation
+├── wrangler.toml          # Worker configuration
+└── .dev.vars.example      # Local development environment variables
 ```
 
-## 前置条件
+## Requirements
 
-- Node.js ≥ 22.12（wrangler 4 的要求）
-- 一个 Cloudflare 账号（Workers 免费套餐即可）
-- 从 [@BotFather](https://t.me/BotFather) 拿到的 Bot Token
+- Node.js >= 22.12 (required by Wrangler 4)
+- A Cloudflare account (the free Workers plan is sufficient)
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
-## 部署步骤
+## Deployment
 
-### 1. 安装依赖
+### 1. Install Dependencies
 
 ```powershell
 npm install
 ```
 
-### 2. 创建 KV namespace
+### 2. Create a KV Namespace
 
 ```powershell
 npx wrangler kv namespace create BOT_KV
 ```
 
-把输出里的 `id` 填进 `wrangler.toml`：
+Copy the namespace ID from the output into `wrangler.toml`:
 
 ```toml
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "输出里的 32 位 id"
+id = "your-32-character-namespace-id"
 ```
 
-### 3. 写入 Secrets
+### 3. Configure Worker Secrets
+
+Set the bot token and webhook secret:
 
 ```powershell
 npx wrangler secret put BOT_TOKEN
 npx wrangler secret put WEBHOOK_SECRET
 ```
 
-`WEBHOOK_SECRET` 用随机高强度字符串，例如：
+Generate a random webhook secret:
 
 ```powershell
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-> 这个值同时要传给 Telegram 的 `setWebhook`，两处必须完全一致。
+Keep this value somewhere safe. You will need the exact same value when configuring the Telegram webhook.
 
-### 4. 写入主人 UID
+Neither secret should be committed to your repository.
+
+### 4. Set the Owner ID
+
+Store your Telegram user ID in KV:
 
 ```powershell
 npx wrangler kv key put --binding=BOT_KV --remote owner_id 6150217362
 ```
 
-之后换主人只需要改这个键，**不用重新部署**：
+You can change the owner at any time without redeploying the Worker:
 
 ```powershell
-npx wrangler kv key put --binding=BOT_KV --remote owner_id 新的UID
+npx wrangler kv key put --binding=BOT_KV --remote owner_id NEW_TELEGRAM_USER_ID
 ```
 
-### 5. 部署
+### 5. Deploy the Worker
 
 ```powershell
 npx wrangler deploy
 ```
 
-记下输出里的地址，形如 `https://telegram-relay-bot.<你的子域>.workers.dev`。
+Take note of the deployed Worker URL. It should look something like:
 
-### 6. 设置 Webhook
+```text
+https://telegram-relay-bot.<your-subdomain>.workers.dev
+```
+
+### 6. Configure the Telegram Webhook
+
+In PowerShell, set the following variables:
 
 ```powershell
-$TOKEN  = "123456:你的BotToken"
-$SECRET = "与 WEBHOOK_SECRET 完全一致的值"
-$WORKER = "https://telegram-relay-bot.<你的子域>.workers.dev"
+$TOKEN  = "123456:YOUR_BOT_TOKEN"
+$SECRET = "YOUR_WEBHOOK_SECRET"
+$WORKER = "https://telegram-relay-bot.<your-subdomain>.workers.dev"
+```
 
+Register the webhook:
+
+```powershell
 curl.exe -sS -X POST "https://api.telegram.org/bot$TOKEN/setWebhook" `
   -d "url=$WORKER/" `
   -d "secret_token=$SECRET"
 ```
 
-> Windows PowerShell 里 `curl` 是 `Invoke-WebRequest` 的别名，必须写 `curl.exe`。
-
-检查状态：
+Check the webhook status:
 
 ```powershell
 curl.exe -sS "https://api.telegram.org/bot$TOKEN/getWebhookInfo"
 ```
 
-正常时 `url` 是上面的地址，`pending_update_count` 为 0，`last_error_message` 为空。
+A healthy configuration should have:
 
-### 7. 开始使用
+- `url` set to your Worker URL.
+- `pending_update_count` equal to `0`.
+- `last_error_message` empty.
 
-**先让主人账号给 Bot 发一条 `/start`。** Telegram 不允许 Bot 主动给从未启动过它的用户发消息，否则会报 `403: bot can't initiate conversation with a user`。
+**Note:** Use `curl.exe` instead of `curl` in Windows PowerShell, where `curl` is an alias for `Invoke-WebRequest`.
 
-然后用另一个账号给 Bot 发消息，主人应收到通知；主人直接回复通知即可回信。
+### 7. Start Using the Bot
 
-## 命令
+Before receiving messages, open a private chat with your bot and send `/start` from the owner account.
 
-| 操作 | 方式 |
+Telegram bots cannot initiate private conversations with users who have never started them. Without this step, the bot will receive a `403: bot can't initiate conversation with a user` error when trying to send you notifications.
+
+Once you have started the bot, send a message from another Telegram account. You should receive a notification and can reply directly to it.
+
+## Commands
+
+| Action | How to use |
 | --- | --- |
-| 回复用户 | 直接回复 Bot 发来的通知，可发文字、图片、视频、文件、语音或贴纸 |
-| 屏蔽用户 | 回复通知并发送 `/spam` |
-| 解除屏蔽 | 回复通知并发送 `/unspam` |
-| 查看命令说明 | 在 Bot 私聊里发送 `/start` 或 `/help` |
+| Reply to a user | Reply directly to a forwarded notification |
+| Block a user | Reply to a notification with `/spam` |
+| Unblock a user | Reply to a notification with `/unspam` |
+| Show help | Send `/start` or `/help` in the bot's private chat |
 
-`/spam` 以 `chat_id` 为单位：私聊时等于屏蔽该用户，群聊时等于屏蔽整个群。屏蔽写入后全球生效可能有最多约 60 秒的 KV 最终一致性延迟。
+The blocklist is keyed by `chat_id`:
 
-也可以直接操作 KV：
+- In private chats, `/spam` blocks that user.
+- In group chats, `/spam` blocks the entire group.
+
+KV replication is eventually consistent. Changes to the blocklist may take up to approximately 60 seconds to propagate globally.
+
+### Managing the Blocklist Manually
+
+List all blocklist entries:
 
 ```powershell
-# 查看所有屏蔽键
 npx wrangler kv key list --binding=BOT_KV --remote
+```
 
-# 手动解除屏蔽
+Remove a blocklist entry:
+
+```powershell
 npx wrangler kv key delete --binding=BOT_KV --remote "spam:123456789"
 ```
 
-## 本地开发
+## Local Development
+
+### 1. Configure Environment Variables
+
+Copy the example file:
 
 ```powershell
 Copy-Item .dev.vars.example .dev.vars
-# 编辑 .dev.vars，填入 BOT_TOKEN 与 WEBHOOK_SECRET
+```
+
+Edit `.dev.vars` and provide your `BOT_TOKEN` and `WEBHOOK_SECRET`.
+
+### 2. Start the Development Server
+
+```powershell
 npx wrangler dev
 ```
 
-本地 KV 与线上 KV 是两套存储，需要单独写入：
+Local KV and remote KV are separate namespaces. If you need an owner ID for local testing, set it explicitly:
 
 ```powershell
 npx wrangler kv key put --binding=BOT_KV --local owner_id 6150217362
 ```
 
-不经过 Telegram、直接模拟一次 webhook 请求：
+### 3. Test the Webhook Locally
+
+You can simulate a Telegram webhook request without sending an actual Telegram message:
 
 ```powershell
 $body = @'
-{"update_id":1,"message":{"message_id":42,"date":0,"chat":{"id":123456789,"type":"private"},"from":{"id":123456789,"is_bot":false,"first_name":"测试","username":"tester"},"text":"你好"}}
+{"update_id":1,"message":{"message_id":42,"date":0,"chat":{"id":123456789,"type":"private"},"from":{"id":123456789,"is_bot":false,"first_name":"Test","username":"tester"},"text":"Hello"}}
 '@
 
 curl.exe -sS -X POST "http://127.0.0.1:8787/" `
   -H "Content-Type: application/json" `
-  -H "X-Telegram-Bot-Api-Secret-Token: 与 .dev.vars 中的 WEBHOOK_SECRET 一致" `
+  -H "X-Telegram-Bot-Api-Secret-Token: YOUR_LOCAL_WEBHOOK_SECRET" `
   --data-binary $body
 ```
 
-## 安全与限制
+Make sure the secret matches the value in your local `.dev.vars` file.
 
-- Bot Token 只存在 Secret 中，日志与错误信息不会带出 token。
-- 转发内容是明文；Telegram 与 Cloudflare 都能看到，不适合传敏感信息。
-- 没有白名单和限速：任何人只要知道 Bot 用户名都能给主人发消息。需要的话可以在 KV 里加 `allow:<chat_id>` 或按 chat 做冷却。
-- 单条消息上限 4096 字符，媒体 caption 上限 1024 字符，超出部分会被截断（通知与回信都会）。
-- 媒体按 `file_id` 转发，不落地、不重新上传；文件过大或类型不被接受时会退化为文字通知。
-- 贴纸本身没有 caption，不能直接回复贴纸，请回复紧随其后的文字通知。
-- 主人的媒体回复同样按 `file_id` 转发，不下载、不重新上传。
-- 只有 `owner_id` 对应私聊里的消息会被当作主人指令；Bot 被拉进群时，群消息会以整个群为单位转发和屏蔽。
-- 群聊里主人的发言不会触发指令（因为 `chat.id` 是群 id 而不是主人 UID）。
+## Security and Limitations
 
-## 常见问题
+- **Credentials:** The bot token is stored in Worker Secrets and is never included in source code or log messages.
+- **Message privacy:** Messages are forwarded as plaintext. Both Telegram and Cloudflare can access the message contents. Do not use this bot to exchange sensitive information.
+- **No rate limiting:** Anyone who knows the bot's username can send messages to the owner. If needed, you can add an `allow:<chat_id>` whitelist or implement per-chat rate limiting using KV.
+- **Message length:** Telegram text messages are limited to 4096 characters. Media captions are limited to 1024 characters. Longer content is truncated.
+- **Media handling:** Media is forwarded using `file_id` without downloading or re-uploading. Files that exceed Telegram's limits or use unsupported types fall back to text notifications.
+- **Stickers:** Stickers do not support captions or routing metadata. Reply to the accompanying text notification instead.
+- **Owner identification:** Only messages sent by the configured owner account in a private chat are treated as owner commands.
+- **Group behavior:** If the bot is added to a group, messages from that group are forwarded using the group's `chat_id`. Blocking the group blocks all messages from it.
+- **Group limitations:** Owner commands sent in groups are not supported because the group's `chat.id` is different from the owner's user ID.
 
-**401 Unauthorized**：请求头 `X-Telegram-Bot-Api-Secret-Token` 缺失或不匹配。检查 `setWebhook` 时传的 `secret_token` 与 Worker 里的 `WEBHOOK_SECRET` 是否一致。
+## Troubleshooting
 
-**收不到通知**：确认主人已给 Bot 发过 `/start`；确认 KV 里有 `owner_id`（`npx wrangler kv key get --binding=BOT_KV --remote owner_id`）；用 `wrangler tail` 或面板日志看是否有 Telegram API 报错。
+### `401 Unauthorized`
 
-**回信没发出去**：原用户可能已经删除会话或屏蔽了 Bot；`allow_sending_without_reply` 只解决原消息被删除的情况，解决不了对方拒收。
+The webhook secret header is missing or does not match the configured secret.
 
-**回复贴纸没反应**：贴纸没有 caption，本身不带路由。回复贴纸下方那条「来消息了」文字通知即可。
+Check that the `secret_token` passed to `setWebhook` exactly matches the `WEBHOOK_SECRET` configured in Worker Secrets.
 
-**改了 owner_id 不生效**：KV 读取有缓存，等约 60 秒；同时确认值里没有多余空格。
+### Notifications Are Not Arriving
+
+Check the following:
+
+1. Make sure the owner account has sent `/start` to the bot.
+2. Verify that `owner_id` exists in KV:
+
+   ```powershell
+   npx wrangler kv key get --binding=BOT_KV --remote owner_id
+   ```
+
+3. Check Worker logs using `wrangler tail` or the Cloudflare dashboard for Telegram API errors.
+
+### Replies Are Not Delivered
+
+The original user may have deleted the conversation or blocked the bot.
+
+`allow_sending_without_reply` only handles cases where the original message has been deleted. It does not bypass Telegram's restrictions on sending messages to users who have blocked the bot.
+
+### Replying to a Sticker Does Nothing
+
+Stickers do not contain routing metadata. Reply to the text notification sent immediately after the sticker instead.
+
+### Changes to `owner_id` Are Not Taking Effect
+
+KV reads may be cached or temporarily inconsistent. Wait approximately 60 seconds and try again.
+
+Also make sure the stored value does not contain leading or trailing whitespace.
+
+---
+
+## License
+
+Add your preferred license here.
