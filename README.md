@@ -315,4 +315,4 @@ Also make sure the stored value does not contain leading or trailing whitespace.
 
 ## License
 
-Add your preferred license here.
+The MIT License.
